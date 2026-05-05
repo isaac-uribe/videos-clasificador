@@ -1,0 +1,7 @@
+mysql-connector-python
+opencv-python
+torch
+torchvision
+transformers
+Pillow
+numpy
