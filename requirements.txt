@@ -5,3 +5,6 @@ torchvision
 transformers
 Pillow
 numpy
+librosa
+soundfile
+laion-clap
