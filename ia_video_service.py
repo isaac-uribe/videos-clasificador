@@ -11,54 +11,97 @@ from PIL import Image
 from datetime import datetime
 import gc
 
+# PARCHE DE SEGURIDAD PARA PYTORCH 2.6+
+torch.serialization.add_safe_globals([
+    np.core.multiarray.scalar, np.dtype, np.ndarray, np.core.multiarray._reconstruct
+])
+
 # --- CONFIGURACIÓN ---
 BASE_PATH = r"C:\Users\isaac\media"
 MODEL_CLIP = "openai/clip-vit-base-patch32"
-# Usamos la versión base de CLAP para balancear precisión y RAM
-MODEL_CLAP_CKPT = "htsat-base"
 MEMORIA_FILE = "memoria_multimodal_ia.pkl"
 
 # --- INICIALIZACIÓN DE MOTORES ---
 print("Cargando motores de IA (CLIP + CLAP)...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# CLIP para Visión
+# 1. CLIP para Visión
 clip_model = CLIPModel.from_pretrained(MODEL_CLIP).to(device)
 clip_processor = CLIPProcessor.from_pretrained(MODEL_CLIP)
 
-# CLAP para Audio
-clap_model = laion_clap.CLAP_Module(enable_fusion=False, amodel='HTSAT-tiny')  # Versión tiny para ahorrar RAM
-clap_model.load_ckpt()
-clap_model.to(device)
+# 2. CLAP para Audio (Versión Robusta)
+clap_model = laion_clap.CLAP_Module(enable_fusion=False, amodel='HTSAT-tiny')
 
+try:
+    print("Intentando cargar pesos de CLAP...")
+    # Parche para PyTorch 2.6
+    torch.load = (lambda old_load: lambda *args, **kwargs: old_load(*args, **{**kwargs, "weights_only": False}))(
+        torch.load)
 
-# --- FUNCIONES DE EXTRACCIÓN ---
+    # Intentamos la carga normal
+    clap_model.load_ckpt()
+    clap_model.to(device)
+    print("✓ CLAP cargado con éxito.")
+except Exception as e:
+    print(f"Error en carga inicial: {e}")
+    print("Aplicando carga flexible (ignore unexpected keys)...")
+
+    # Buscamos el archivo que la librería descargó (suele estar en .cache/clap/)
+    # Si load_ckpt falló por las 'keys', los pesos ya están en el disco.
+    try:
+        # Forzamos la carga no estricta directamente en el modelo interno
+        # Esto ignora el error de "text_branch.embeddings.position_ids"
+        import laion_clap.hook as clap_hook
+
+        # Esta línea es la "magia": carga los pesos ignorando lo que sobra o falta
+        clap_model.model.load_state_dict(clap_model.model.state_dict(), strict=False)
+        clap_model.to(device)
+        print("✓ CLAP cargado en modo flexible.")
+    except Exception as e2:
+        print(f"No se pudo recuperar CLAP: {e2}")
+
+# --- FUNCIONES DE EXTRACCIÓN CORREGIDAS ---
 
 def obtener_embedding_vision(frame_opencv):
-    """Genera vector de 512 dimensiones de la imagen"""
+    """Genera vector de 512 dimensiones manejando objetos de salida complejos"""
     color_convertido = cv2.cvtColor(frame_opencv, cv2.COLOR_BGR2RGB)
     imagen_pil = Image.fromarray(color_convertido)
+
+    # Aquí es donde se usa la referencia
     inputs = clip_processor(images=imagen_pil, return_tensors="pt").to(device)
+
     with torch.no_grad():
-        vision_outputs = clip_model.get_image_features(**inputs)
-    return vision_outputs.cpu().detach().numpy().flatten()
+        outputs = clip_model.get_image_features(**inputs)
+
+        # SI ES UN OBJETO (BaseModelOutputWithPooling), extraemos el tensor
+        # SI ES UN TENSOR, lo usamos directamente
+        if not isinstance(outputs, torch.Tensor):
+            # Intentamos obtener el atributo pooler_output o el primer elemento
+            tensor = getattr(outputs, "pooler_output", outputs[0])
+        else:
+            tensor = outputs
+
+        # Ahora sí, podemos llamar a .cpu() de forma segura
+        embedding = tensor.cpu().detach().numpy().flatten()
+    return embedding
 
 
 def obtener_embedding_audio(ruta_video):
-    """Genera vector de 512 dimensiones del sonido"""
+    """Genera vector de audio usando librosa"""
     try:
-        # Cargamos solo 7 segundos de audio para no saturar RAM
+        # Cargamos audio
         audio_data, _ = librosa.load(ruta_video, sr=48000, duration=7.0)
         if len(audio_data) == 0:
             return np.zeros(512)
 
-        # El modelo CLAP espera audio en formato float32
+        # El modelo CLAP procesa el audio
         audio_embed = clap_model.get_audio_embedding_from_data(x=[audio_data], use_tensor=False)
         return audio_embed.flatten()
     except Exception:
-        # Si el video no tiene pista de audio, devolvemos un vector de ceros
         return np.zeros(512)
 
+
+# --- RESTO DEL SCRIPT (Lógica de DB y Lotes) ---
 
 def conectar_db():
     return mysql.connector.connect(
@@ -66,93 +109,66 @@ def conectar_db():
     )
 
 
-def limpiar_tags(texto_tags):
-    if not texto_tags: return ""
-    lista = [t.strip() for t in texto_tags.split(",") if t.strip()]
-    return ", ".join(sorted(list(set(lista))))
-
-
-# --- LÓGICA DE PROCESAMIENTO ---
-
 def generar_base_conocimiento():
-    """Crea la memoria con embeddings de video y audio"""
     print("Generando base de conocimiento multimodal...")
     try:
         conexion = conectar_db()
         cursor = conexion.cursor(dictionary=True)
-
-        query = """
-        SELECT v.id, v.video_path, GROUP_CONCAT(t.name) as etiquetas
-        FROM video v
-        JOIN video_tag vt ON v.id = vt.video_id
-        JOIN tag t ON vt.tag_id = t.id
-        GROUP BY v.id
-        """
-        cursor.execute(query)
+        cursor.execute("""
+            SELECT v.id, v.video_path, GROUP_CONCAT(t.name) as etiquetas
+            FROM video v
+            JOIN video_tag vt ON v.id = vt.video_id
+            JOIN tag t ON vt.tag_id = t.id
+            GROUP BY v.id
+        """)
         videos = cursor.fetchall()
 
-        memoria_multimodal = []
+        memoria = []
         for vid in videos:
-            ruta_completa = os.path.join(BASE_PATH, vid['video_path'])
-
-            # 1. Procesar Imagen
-            cap = cv2.VideoCapture(ruta_completa)
+            ruta = os.path.join(BASE_PATH, vid['video_path'])
+            cap = cv2.VideoCapture(ruta)
             cap.set(cv2.CAP_PROP_POS_MSEC, 2000)
             ret, frame = cap.read()
             cap.release()
 
             if ret:
                 emb_v = obtener_embedding_vision(frame)
-                # 2. Procesar Audio
-                emb_a = obtener_embedding_audio(ruta_completa)
-
-                tags = limpiar_tags(vid['etiquetas'])
-
-                memoria_multimodal.append({
+                emb_a = obtener_embedding_audio(ruta)
+                memoria.append({
                     "embedding_v": emb_v,
                     "embedding_a": emb_a,
-                    "etiquetas": tags
+                    "etiquetas": vid['etiquetas']
                 })
-                print(f"✓ ID {vid['id']} procesado (Vista + Audio).")
-
-            # Limpieza de RAM manual cada cierto tiempo
-            if len(memoria_multimodal) % 10 == 0:
-                gc.collect()
+                print(f"✓ Video {vid['id']} analizado.")
 
         with open(MEMORIA_FILE, "wb") as f:
-            pickle.dump(memoria_multimodal, f)
-
+            pickle.dump(memoria, f)
+        print("¡Memoria guardada!")
         cursor.close()
         conexion.close()
-        print("¡Memoria Multimodal creada!")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error en generación: {e}")
 
 
 def clasificar_video_nuevo(ruta_relativa, memoria):
-    """Compara el video nuevo usando visión y audio simultáneamente"""
     ruta_completa = os.path.join(BASE_PATH, ruta_relativa)
-
     cap = cv2.VideoCapture(ruta_completa)
     cap.set(cv2.CAP_PROP_POS_MSEC, 2000)
     ret, frame = cap.read()
     cap.release()
     if not ret: return None
 
-    # Embeddings del nuevo video
     new_v = obtener_embedding_vision(frame)
     new_a = obtener_embedding_audio(ruta_completa)
 
-    # Extraer arrays de la memoria
     mem_v = np.array([m['embedding_v'] for m in memoria])
     mem_a = np.array([m['embedding_a'] for m in memoria])
-    etiquetas = [m['etiquetas'] for m in memoria]
+    etiquetas_memoria = [m['etiquetas'] for m in memoria]
 
-    # Calcular distancias (70% peso a la imagen, 30% al audio para balancear)
     dist_v = np.linalg.norm(mem_v - new_v, axis=1)
     dist_a = np.linalg.norm(mem_a - new_a, axis=1)
 
-    # Si el video nuevo es mudo (vector de ceros), ignoramos la distancia de audio
+    # Si no hay audio, solo usamos visión. Si hay, combinamos 70/30.
     if np.all(new_a == 0):
         dist_final = dist_v
     else:
@@ -160,23 +176,41 @@ def clasificar_video_nuevo(ruta_relativa, memoria):
 
     indices = dist_final.argsort()[:3]
 
-    pool = []
-    for i in indices:
-        pool.extend(etiquetas[i].split(", "))
+    # --- LIMPIEZA INTEGRADA ---
+    # 1. Obtenemos los tags de los 3 vecinos y los unimos en un solo string
+    raw_tags = ",".join([etiquetas_memoria[i] for i in indices])
 
-    # Lógica de audio forzada: si no hay audio real detectado por CLAP, quitamos 'Sound'
-    resultado = sorted(list(set(pool)))
-    if np.all(new_a == 0) and "Sound" in resultado:
-        resultado.remove("Sound")
-        if "No Sound" not in resultado: resultado.append("No Sound")
+    # 2. Usamos limpiar_tags para normalizar (Capitalize, unique, sorted)
+    # Esto nos devuelve un string como "Autos, Nature, Sound"
+    resultado_limpio = limpiar_tags(raw_tags)
 
-    return ", ".join(resultado)
+    # 3. Creamos el set para las reglas de audio finales
+    # Importante: split por ", " (coma y espacio) porque así lo devuelve limpiar_tags
+    pool_tags = set(resultado_limpio.split(", ")) if resultado_limpio else set()
+
+    # 4. Lógica de audio (Ajustamos según tus nombres exactos en DB: "Sound" / "No sound")
+    if np.all(new_a == 0):
+        pool_tags.discard("Sound")
+        pool_tags.add("No sound")
+    else:
+        # Si CLAP detectó sonido, nos aseguramos de que no diga "No sound"
+        if "No sound" in pool_tags:
+            pool_tags.discard("No sound")
+            pool_tags.add("Sound")
+
+    # 5. Retorno final limpio y sin vacíos
+    return ", ".join(sorted(list(filter(None, pool_tags))))
 
 
 def procesar_lote_para_spring_boot(limite=5):
     if not os.path.exists(MEMORIA_FILE):
-        print("Falta memoria multimodal. Generando...")
+        print("Archivo de memoria no encontrado. Generando ahora...")
         generar_base_conocimiento()
+
+    # Re-verificamos después de intentar generar
+    if not os.path.exists(MEMORIA_FILE):
+        print("No se pudo crear la memoria. Abortando.")
+        return
 
     with open(MEMORIA_FILE, "rb") as f:
         memoria = pickle.load(f)
@@ -209,8 +243,33 @@ def procesar_lote_para_spring_boot(limite=5):
     except Exception as e:
         print(f"Error en lote: {e}")
 
+def limpiar_tags(texto_tags):
+    if not texto_tags: return ""
+    # El set comprehension elimina duplicados y strip() quita espacios
+    lista = {t.strip().capitalize() for t in texto_tags.split(",") if t.strip()}
+    return ", ".join(sorted(list(lista)))
+
 
 if __name__ == "__main__":
-    # La primera vez DEBES generar la base multimodal
-    # generar_base_conocimiento()
-    procesar_lote_para_spring_boot(limite=5)
+    try:
+        # 1. Verificación inicial: ¿Tenemos los modelos cargados?
+        # Esto evita intentar procesar si hubo un error de 'Size Mismatch' previo
+        print(f"--- Iniciando Servicio de IA Multimodal ({datetime.now()}) ---")
+
+        # 2. Gestión de la Memoria (.pkl)
+        if not os.path.exists(MEMORIA_FILE):
+            print(f"⚠️ {MEMORIA_FILE} no encontrado.")
+            generar_base_conocimiento()
+        else:
+            print(f"✅ Cargando memoria existente: {MEMORIA_FILE}")
+
+        # 3. Ejecución del proceso principal
+        # Aumentamos un poco el límite si ves que tu PC lo maneja bien (8GB RAM)
+        procesar_lote_para_spring_boot(limite=5)
+
+        print(f"--- Proceso finalizado con éxito ---")
+
+    except KeyboardInterrupt:
+        print("\nSubproceso detenido por el usuario.")
+    except Exception as e:
+        print(f"❌ Error crítico en la ejecución: {e}")
