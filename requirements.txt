@@ -1,10 +1,22 @@
+# --- BASE ---
+numpy
 mysql-connector-python
+
+# --- VISIÓN Y PROCESAMIENTO ---
 opencv-python
+Pillow
+
+# --- IA Y DEEP LEARNING ---
 torch
 torchvision
 transformers
-Pillow
-numpy
+laion-clap
+
+# --- AUDIO (Correcciones para FFmpeg y lectura) ---
 librosa
 soundfile
-laion-clap
+audioread
+yt-dlp
+
+# --- UTILIDADES ---
+tqdm
