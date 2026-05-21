@@ -197,41 +197,68 @@ def clasificar_video_nuevo(ruta_relativa, memoria):
     cap.release()
     if not ret: return None
 
-    new_v = obtener_embedding_vision(frame)
+    # --- PASO 1: EXTRAER TODOS LOS TAGS ÚNICOS (SEPARANDO VIDEO Y AUDIO) ---
+    tags_video_entreno = set()
+
+    # Variables dinámicas para capturar cómo se llaman tus etiquetas de audio en el entreno
+    tag_con_sonido_real = None
+    tag_sin_sonido_real = None
+
+    for m in memoria:
+        if m['etiquetas']:
+            for t in m['etiquetas'].split(','):
+                t_limpio = t.strip()
+                if not t_limpio:
+                    continue
+
+                # Identificamos dinámicamente las variantes de audio del entrenamiento
+                t_lower = t_limpio.lower()
+                if t_lower in ["sound", "sonido", "con sonido"]:
+                    tag_con_sonido_real = t_limpio
+                elif t_lower in ["no sound", "sin sonido", "silencio", "mute"]:
+                    tag_sin_sonido_real = t_limpio
+                else:
+                    # Todo lo demás va al pool de CLIP (visión)
+                    tags_video_entreno.add(t_limpio)
+
+    # Valores por defecto de emergencia si un usuario no ha entrenado videos con audio aún
+    if not tag_con_sonido_real: tag_con_sonido_real = "Sound"
+    if not tag_sin_sonido_real: tag_sin_sonido_real = "No sound"
+
+    # --- PASO 2: CLASIFICACIÓN MULTI-ETIQUETA DIRECTA CON CLIP (VISIÓN) ---
+    color_convertido = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    imagen_pil = Image.fromarray(color_convertido)
+    pool_tags = set()
+
+    for tag in list(tags_video_entreno):
+        descripcion_prompt = f"a photo of {tag.lower()}"
+        textos_evaluacion = [descripcion_prompt, "a random background with no focus"]
+
+        inputs = clip_processor(text=textos_evaluacion, images=imagen_pil, return_tensors="pt", padding=True).to(device)
+
+        with torch.no_grad():
+            outputs = clip_model(**inputs)
+            logits_per_image = outputs.logits_per_image
+            probs = logits_per_image.softmax(dim=-1).cpu().numpy()[0]
+
+        prob_concepto = probs[0]
+        if prob_concepto > 0.65:
+            pool_tags.add(tag)
+
+    # --- PASO 3: LÓGICA DE AUDIO 100% DINÁMICA ---
     new_a = obtener_embedding_audio(ruta_completa)
-
-    mem_v = np.array([m['embedding_v'] for m in memoria])
-    mem_a = np.array([m['embedding_a'] for m in memoria])
-    etiquetas_memoria = [m['etiquetas'] for m in memoria]
-
-    dist_v = np.linalg.norm(mem_v - new_v, axis=1)
-    dist_a = np.linalg.norm(mem_a - new_a, axis=1)
-
-    # Detección de silencio real
     es_silencio = np.all(new_a == 0)
 
     if es_silencio:
-        dist_final = dist_v
+        # Quitamos cualquier rastro de sonido y ponemos la etiqueta real detectada de silencio
+        pool_tags.discard(tag_con_sonido_real)
+        pool_tags.add(tag_sin_sonido_real)
     else:
-        dist_final = (dist_v * 0.7) + (dist_a * 0.3)
+        # Quitamos cualquier rastro de silencio y ponemos la etiqueta real de sonido
+        pool_tags.discard(tag_sin_sonido_real)
+        pool_tags.add(tag_con_sonido_real)
 
-    indices = dist_final.argsort()[:3]
-    raw_tags = ",".join([etiquetas_memoria[i] for i in indices])
-    resultado_limpio = limpiar_tags(raw_tags)
-
-    # Convertimos a set para manipular
-    pool_tags = set(resultado_limpio.split(", ")) if resultado_limpio else set()
-
-    # --- LÓGICA DE AUDIO FORZADA ---
-    if es_silencio:
-        pool_tags.discard("Sound")
-        pool_tags.add("No sound")
-    else:
-        # AQUÍ ESTÁ EL CAMBIO: Si hay audio, quitamos No sound y OBLIGAMOS a que esté Sound
-        pool_tags.discard("No sound")
-        pool_tags.add("Sound")
-
-    # Limpiar posibles strings vacíos y devolver ordenado
+    # Limpiar posibles strings vacíos y ordenar alfabéticamente
     lista_final = sorted(list(filter(None, pool_tags)))
     return ", ".join(lista_final)
 
