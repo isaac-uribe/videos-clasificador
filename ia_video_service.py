@@ -9,6 +9,7 @@ import laion_clap
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 from datetime import datetime
+from dotenv import load_dotenv
 import gc
 
 # PARCHE DE SEGURIDAD PARA PYTORCH 2.6+
@@ -16,8 +17,19 @@ torch.serialization.add_safe_globals([
     np.core.multiarray.scalar, np.dtype, np.ndarray, np.core.multiarray._reconstruct
 ])
 
-# --- CONFIGURACIÓN ---
-BASE_PATH = r"C:\Users\isaac\media"
+load_dotenv()
+raw_path = os.getenv("BASE_PATH")
+
+# 2. TRUCO MAESTRO: Si por alguna razón el .env no existe o está vacío,
+# ponemos una ruta relativa por defecto que funciona en cualquier sistema.
+if not raw_path:
+    # Toma la carpeta donde está guardado este script actualmente
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    raw_path = os.path.join(script_dir, "media")
+
+# 3. os.path.normpath se encarga de convertir las barra '/' o '\'
+# según el sistema operativo donde esté corriendo (Windows o Ubuntu)
+BASE_PATH = os.path.normpath(raw_path)
 MODEL_CLIP = "openai/clip-vit-base-patch32"
 MEMORIA_FILE = "memoria_multimodal_ia.pkl"
 
@@ -144,7 +156,11 @@ def obtener_embedding_audio(ruta_video):
 
 def conectar_db():
     return mysql.connector.connect(
-        host="localhost", port=3306, user="root", password="12345678", database="videos"
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", 3306)),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_DATABASE")
     )
 
 
@@ -225,25 +241,39 @@ def clasificar_video_nuevo(ruta_relativa, memoria):
     if not tag_con_sonido_real: tag_con_sonido_real = "Sound"
     if not tag_sin_sonido_real: tag_sin_sonido_real = "No sound"
 
-    # --- PASO 2: CLASIFICACIÓN MULTI-ETIQUETA DIRECTA CON CLIP (VISIÓN) ---
+    # --- PASO 2: CLASIFICACIÓN EN GRUPO (COMPETENCIA REAL) ---
     color_convertido = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     imagen_pil = Image.fromarray(color_convertido)
     pool_tags = set()
 
-    for tag in list(tags_video_entreno):
-        descripcion_prompt = f"a photo of {tag.lower()}"
-        textos_evaluacion = [descripcion_prompt, "a random background with no focus"]
+    # Convertimos el set a una lista indexada para mantener el orden
+    lista_tags_dinamicos = list(tags_video_entreno)
 
+    if lista_tags_dinamicos:
+        # 1. Creamos la lista de preguntas completas para CLIP
+        textos_evaluacion = [f"a photo of {tag.lower()}" for tag in lista_tags_dinamicos]
+
+        # Agregamos una opción de "escape" por si el video no tiene nada de lo que hay en el entreno
+        textos_evaluacion.append("a photo of a random background with no focus")
+
+        # 2. Enviamos el lote completo a CLIP de un solo golpe (¡Mucho más rápido!)
         inputs = clip_processor(text=textos_evaluacion, images=imagen_pil, return_tensors="pt", padding=True).to(device)
 
         with torch.no_grad():
             outputs = clip_model(**inputs)
             logits_per_image = outputs.logits_per_image
+            # Aquí el 100% de la probabilidad se reparte estrictamente entre todos los tags juntos
             probs = logits_per_image.softmax(dim=-1).cpu().numpy()[0]
 
-        prob_concepto = probs[0]
-        if prob_concepto > 0.65:
-            pool_tags.add(tag)
+        # 3. Evaluamos individualmente cuál obtuvo suficiente fuerza en la repartición
+        # El umbral ideal cuando compiten muchos elementos suele estar entre 0.15 y 0.25 (15% a 25% de peso)
+        UMBRAL_COMPETENCIA = 0.20
+
+        for idx, tag in enumerate(lista_tags_dinamicos):
+            prob_concepto = probs[idx]
+
+            if prob_concepto > UMBRAL_COMPETENCIA:
+                pool_tags.add(tag)
 
     # --- PASO 3: LÓGICA DE AUDIO 100% DINÁMICA ---
     new_a = obtener_embedding_audio(ruta_completa)
